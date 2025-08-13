@@ -134,23 +134,13 @@ class CattleDiseaseClassifier:
                 if item['class']:
                     class_votes[item['class']] = class_votes.get(item['class'], 0) + item['similarity']
                 
-                # Stage voting - only if stage exists and is meaningful
-                if item['stage'] and item['stage'].strip() and 'stade' in item['stage'].lower():
+                # Stage voting
+                if item['stage']:
                     stage_votes[item['stage']] = stage_votes.get(item['stage'], 0) + item['similarity']
             
             # Get best class and stage
             best_class = max(class_votes.items(), key=lambda x: x[1])[0] if class_votes else "Unknown"
-            
-            # Only return stage if we have meaningful stage votes and good confidence
-            best_stage = None
-            if stage_votes:
-                # Get the stage with highest vote
-                potential_stage = max(stage_votes.items(), key=lambda x: x[1])[0]
-                stage_confidence = stage_votes[potential_stage] / sum(stage_votes.values())
-                
-                # Only include stage if confidence is high enough and it's a real stage
-                if stage_confidence > 0.6 and any(word in potential_stage.lower() for word in ['stade', 'stage', '1', '2', '3', '4', 'eme', 'er']):
-                    best_stage = potential_stage
+            best_stage = max(stage_votes.items(), key=lambda x: x[1])[0] if stage_votes else None
             
             # Get description from most similar image
             best_match = similar_images[0]
@@ -160,13 +150,13 @@ class CattleDiseaseClassifier:
             
             return {
                 'class': best_class,
-                'stage': best_stage,  # Will be None if no meaningful stage found
+                'stage': best_stage,
                 'description': best_match['description'],
                 'confidence': float(confidence),
                 'similar_images': [
                     {
                         'class': item['class'],
-                        'stage': item['stage'] if item['stage'] and item['stage'].strip() else None,
+                        'stage': item['stage'],
                         'description': item['description'],
                         'similarity': item['similarity']
                     }
@@ -180,15 +170,6 @@ class CattleDiseaseClassifier:
 
 # Initialize the classifier
 classifier = None
-
-@app.route('/', methods=['GET'])
-def home():
-    """Home endpoint"""
-    return jsonify({
-        'message': 'VetAI Cattle Disease Classification API',
-        'status': 'running',
-        'version': '1.0.0'
-    })
 
 @app.route('/health', methods=['GET'])
 def health_check():
@@ -293,8 +274,5 @@ if __name__ == '__main__':
         logger.error(f"Failed to initialize classifier: {e}")
         exit(1)
     
-    # Get port from environment variable or default to 5000
-    port = int(os.environ.get('PORT', 5000))
-    
     # Run the Flask app
-    app.run(host='0.0.0.0', port=port, debug=False)
+    app.run(host='0.0.0.0', port=5000, debug=True)

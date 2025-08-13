@@ -14,6 +14,7 @@ import os
 import sys
 import logging
 import gc
+import pickle
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -22,12 +23,13 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 CORS(app)  # Enable CORS for React Native
 
-class OptimizedCattleDiseaseClassifier:
+class MultiFormatCattleDiseaseClassifier:
     def __init__(self):
         self.model = None
         self.dataset_features = None  # Numpy array for efficient computation
         self.dataset_metadata = []     # Lightweight metadata only
         self.initialization_error = None
+        self.dataset_format = None
         
         try:
             # Load the feature extraction model first
@@ -39,135 +41,184 @@ class OptimizedCattleDiseaseClassifier:
             self.initialization_error = f"Model loading failed: {e}"
             return
         
-        # Try to load the dataset with memory optimization
+        # Try to load the dataset with multi-format support
         try:
-            self.load_dataset_optimized()
-            logger.info(f"✅ Dataset loaded: {len(self.dataset_metadata)} entries")
+            self.load_dataset_multi_format()
+            logger.info(f"✅ Dataset loaded: {len(self.dataset_metadata)} entries using {self.dataset_format} format")
         except Exception as e:
             logger.error(f"❌ Error loading dataset: {e}")
             self.initialization_error = f"Dataset loading failed: {e}"
     
     def find_dataset_file(self):
-        """Find the dataset file automatically"""
+        """Find the dataset file automatically, prioritizing efficient formats"""
+        # Priority order: most efficient formats first
         possible_files = [
-            'cattle_disease_features_test_100.json.gz',
-            'cattle_disease_features_optimized.json.gz',
-            'cattle_disease_features.json.gz',
-            'cattle_disease_features_test_100.json',
-            'cattle_disease_features_optimized.json',
-            'cattle_disease_features.json'
+            # NumPy format (most efficient)
+            ('cattle_disease_dataset.npz', 'numpy'),
+            ('cattle_disease_features.npz', 'numpy'),
+            
+            # HDF5 format (great for large datasets)
+            ('cattle_disease_dataset.h5', 'hdf5'),
+            ('cattle_disease_features.h5', 'hdf5'),
+            
+            # Pickle format (Python-specific but efficient)
+            ('cattle_disease_dataset.pkl', 'pickle'),
+            ('cattle_disease_features.pkl', 'pickle'),
+            
+            # Compressed JSON (fallback)
+            ('cattle_disease_features_optimized.json.gz', 'json_gz'),
+            ('cattle_disease_features_test_100.json.gz', 'json_gz'),
+            ('cattle_disease_features.json.gz', 'json_gz'),
+            
+            # Regular JSON (last resort)
+            ('cattle_disease_features_optimized.json', 'json'),
+            ('cattle_disease_features_test_100.json', 'json'),
+            ('cattle_disease_features.json', 'json')
         ]
         
-        for filename in possible_files:
+        for filename, format_type in possible_files:
             if os.path.exists(filename):
-                logger.info(f"📁 Found dataset file: {filename}")
-                return filename
+                logger.info(f"📁 Found dataset file: {filename} (format: {format_type})")
+                return filename, format_type
         
-        return None
+        return None, None
     
-    def load_dataset_optimized(self):
-        """Load dataset with memory optimization"""
+    def load_numpy_format(self, file_path):
+        """Load NumPy .npz format"""
+        logger.info("🔢 Loading NumPy format...")
         
-        # Find the dataset file
-        dataset_path = self.find_dataset_file()
+        data = np.load(file_path)
         
-        if not dataset_path:
-            raise FileNotFoundError("No dataset file found. Expected files: cattle_disease_features_test_100.json.gz or cattle_disease_features.json")
+        self.dataset_features = data['features'].astype(np.float32)
+        classes = data['classes']
+        stages = data['stages'] if 'stages' in data else [''] * len(classes)
+        descriptions = data['descriptions'] if 'descriptions' in data else [''] * len(classes)
         
-        logger.info(f"📁 Loading dataset from: {dataset_path}")
+        # Convert numpy arrays to lists for metadata
+        self.dataset_metadata = []
+        for i in range(len(classes)):
+            self.dataset_metadata.append({
+                'class': str(classes[i]),
+                'stage': str(stages[i]) if stages[i] else None,
+                'description': str(descriptions[i]) if descriptions[i] else None,
+                'index': i
+            })
         
-        file_size = os.path.getsize(dataset_path)
-        logger.info(f"📁 File size: {file_size:,} bytes ({file_size / 1024 / 1024:.2f} MB)")
+        logger.info(f"📊 NumPy data loaded: {self.dataset_features.shape}")
         
-        # Load with appropriate method
+    def load_hdf5_format(self, file_path):
+        """Load HDF5 format"""
+        logger.info("📦 Loading HDF5 format...")
+        
         try:
-            if dataset_path.endswith('.gz'):
-                logger.info("🗜️  Loading compressed file...")
-                with gzip.open(dataset_path, 'rt', encoding='utf-8') as f:
-                    raw_data = json.load(f)
-            else:
-                logger.info("📄 Loading regular JSON file...")
-                with open(dataset_path, 'r', encoding='utf-8') as f:
-                    raw_data = json.load(f)
-            
-            logger.info(f"📊 Raw data loaded: {len(raw_data)} entries")
-            
-            # Process data with memory optimization
-            self.process_dataset_memory_efficient(raw_data)
-            
-            # Clean up
-            del raw_data
-            gc.collect()
-            
-        except json.JSONDecodeError as e:
-            logger.error(f"❌ JSON parsing error: {e}")
-            raise
-        except MemoryError as e:
-            logger.error(f"❌ Memory error: {e}")
-            logger.error("💡 Try using the test dataset (100 entries) instead")
-            raise
-    
-    def process_dataset_memory_efficient(self, raw_data):
-        """Process dataset with memory efficiency"""
+            import h5py
+        except ImportError:
+            raise ImportError("h5py not available. Install with: pip install h5py")
         
-        logger.info("🔄 Processing dataset for memory efficiency...")
+        with h5py.File(file_path, 'r') as f:
+            self.dataset_features = f['features'][:].astype(np.float32)
+            classes = [item.decode('utf-8') for item in f['classes'][:]]
+            stages = [item.decode('utf-8') for item in f['stages'][:]] if 'stages' in f else [''] * len(classes)
+            descriptions = [item.decode('utf-8') for item in f['descriptions'][:]] if 'descriptions' in f else [''] * len(classes)
         
+        self.dataset_metadata = []
+        for i in range(len(classes)):
+            self.dataset_metadata.append({
+                'class': classes[i],
+                'stage': stages[i] if stages[i] else None,
+                'description': descriptions[i] if descriptions[i] else None,
+                'index': i
+            })
+        
+        logger.info(f"📊 HDF5 data loaded: {self.dataset_features.shape}")
+        
+    def load_pickle_format(self, file_path):
+        """Load Pickle format"""
+        logger.info("🥒 Loading Pickle format...")
+        
+        with open(file_path, 'rb') as f:
+            data = pickle.load(f)
+        
+        self.dataset_features = data['features'].astype(np.float32)
+        classes = data['classes']
+        stages = data.get('stages', [''] * len(classes))
+        descriptions = data.get('descriptions', [''] * len(classes))
+        
+        self.dataset_metadata = []
+        for i in range(len(classes)):
+            self.dataset_metadata.append({
+                'class': classes[i],
+                'stage': stages[i] if stages[i] else None,
+                'description': descriptions[i] if descriptions[i] else None,
+                'index': i
+            })
+        
+        logger.info(f"📊 Pickle data loaded: {self.dataset_features.shape}")
+        
+    def load_json_format(self, file_path, compressed=False):
+        """Load JSON format (compressed or regular)"""
+        if compressed:
+            logger.info("🗜️  Loading compressed JSON format...")
+            with gzip.open(file_path, 'rt', encoding='utf-8') as f:
+                raw_data = json.load(f)
+        else:
+            logger.info("📄 Loading JSON format...")
+            with open(file_path, 'r', encoding='utf-8') as f:
+                raw_data = json.load(f)
+        
+        # Process JSON data into efficient format
         features_list = []
         metadata_list = []
         
-        valid_entries = 0
-        invalid_entries = 0
-        
         for i, entry in enumerate(raw_data):
-            try:
-                # Validate entry
-                if not entry.get('features') or not entry.get('class'):
-                    invalid_entries += 1
-                    continue
-                
-                features = entry['features']
-                
-                # Convert to numpy and validate
-                features_array = np.array(features, dtype=np.float32)
-                
-                # Check for invalid values
-                if np.any(np.isnan(features_array)) or np.any(np.isinf(features_array)):
-                    logger.warning(f"⚠️  Skipping entry {i} with invalid features")
-                    invalid_entries += 1
-                    continue
-                
-                # Store features and lightweight metadata
-                features_list.append(features_array)
+            if entry.get('features') and entry.get('class'):
+                features_list.append(np.array(entry['features'], dtype=np.float32))
                 metadata_list.append({
                     'class': entry.get('class', '').strip(),
                     'stage': entry.get('stage', '').strip() if entry.get('stage') else None,
                     'description': entry.get('description', '').strip() if entry.get('description') else None,
-                    'index': valid_entries
+                    'index': i
                 })
-                
-                valid_entries += 1
-                
-                # Progress logging
-                if valid_entries % 50 == 0:
-                    logger.info(f"📊 Processed {valid_entries} entries...")
-                
-            except Exception as e:
-                logger.warning(f"⚠️  Error processing entry {i}: {e}")
-                invalid_entries += 1
-                continue
         
-        # Convert to optimized numpy array
-        if features_list:
-            self.dataset_features = np.array(features_list, dtype=np.float32)
-            self.dataset_metadata = metadata_list
-            
-            logger.info(f"✅ Dataset processing complete:")
-            logger.info(f"   📊 Valid entries: {valid_entries}")
-            logger.info(f"   📊 Invalid entries: {invalid_entries}")
-            logger.info(f"   📊 Features shape: {self.dataset_features.shape}")
-            logger.info(f"   💾 Memory usage: {self.dataset_features.nbytes / 1024 / 1024:.1f} MB")
+        self.dataset_features = np.array(features_list, dtype=np.float32)
+        self.dataset_metadata = metadata_list
+        
+        logger.info(f"📊 JSON data loaded: {self.dataset_features.shape}")
+        
+    def load_dataset_multi_format(self):
+        """Load dataset with multi-format support"""
+        
+        # Find the dataset file
+        dataset_path, format_type = self.find_dataset_file()
+        
+        if not dataset_path:
+            raise FileNotFoundError("No dataset file found. Supported formats: .npz, .h5, .pkl, .json.gz, .json")
+        
+        file_size = os.path.getsize(dataset_path)
+        logger.info(f"📁 Loading dataset from: {dataset_path}")
+        logger.info(f"📁 File size: {file_size:,} bytes ({file_size / 1024 / 1024:.2f} MB)")
+        logger.info(f"📁 Format: {format_type}")
+        
+        self.dataset_format = format_type
+        
+        # Load based on format
+        if format_type == 'numpy':
+            self.load_numpy_format(dataset_path)
+        elif format_type == 'hdf5':
+            self.load_hdf5_format(dataset_path)
+        elif format_type == 'pickle':
+            self.load_pickle_format(dataset_path)
+        elif format_type == 'json_gz':
+            self.load_json_format(dataset_path, compressed=True)
+        elif format_type == 'json':
+            self.load_json_format(dataset_path, compressed=False)
         else:
-            raise ValueError("No valid entries found in dataset")
+            raise ValueError(f"Unsupported format: {format_type}")
+        
+        # Clean up memory
+        gc.collect()
+        
+        logger.info(f"💾 Memory usage: {self.dataset_features.nbytes / 1024 / 1024:.1f} MB")
     
     def preprocess_image(self, image_data):
         """Preprocess image for feature extraction"""
@@ -322,8 +373,10 @@ def health_check():
         'status': 'healthy',
         'model_loaded': classifier is not None and classifier.model is not None,
         'dataset_size': len(classifier.dataset_metadata) if classifier and classifier.dataset_metadata else 0,
+        'dataset_format': classifier.dataset_format if classifier else None,
         'initialization_error': classifier.initialization_error if classifier else initialization_error,
         'memory_optimized': True,
+        'supported_formats': ['npz', 'h5', 'pkl', 'json.gz', 'json'],
         'files_in_directory': file_info
     })
 
@@ -361,7 +414,8 @@ def classify_image():
         
         return jsonify({
             'success': True,
-            'prediction': result
+            'prediction': result,
+            'dataset_format': classifier.dataset_format
         })
         
     except Exception as e:
@@ -400,55 +454,12 @@ def get_stats():
             'total_stages': len(stages),
             'classes': dict(sorted(classes.items())),
             'stages': dict(sorted(stages.items())),
+            'dataset_format': classifier.dataset_format,
             'memory_usage_mb': classifier.dataset_features.nbytes / 1024 / 1024 if classifier.dataset_features is not None else 0
         })
         
     except Exception as e:
         logger.error(f"❌ Error in stats endpoint: {e}")
-        return jsonify({'error': str(e)}), 500
-
-@app.route('/extract-features', methods=['POST'])
-def extract_features_only():
-    """Extract features from image without classification (for testing)"""
-    try:
-        if classifier is None or classifier.model is None:
-            return jsonify({'error': 'Model not loaded'}), 500
-        
-        # Get image data
-        if 'image' not in request.files and 'image' not in request.json:
-            return jsonify({'error': 'No image provided'}), 400
-        
-        image_data = None
-        if 'image' in request.files:
-            file = request.files['image']
-            if file.filename == '':
-                return jsonify({'error': 'No file selected'}), 400
-            image_data = file.read()
-        elif 'image' in request.json:
-            image_data = request.json['image']
-        
-        if image_data is None:
-            return jsonify({'error': 'Invalid image data'}), 400
-        
-        # Preprocess image
-        img_array = classifier.preprocess_image(image_data)
-        if img_array is None:
-            return jsonify({'error': 'Failed to preprocess image'}), 500
-        
-        # Extract features
-        features = classifier.extract_features(img_array)
-        if features is None:
-            return jsonify({'error': 'Failed to extract features'}), 500
-        
-        return jsonify({
-            'success': True,
-            'features_length': len(features),
-            'features_sample': features[:10].tolist(),  # First 10 features
-            'message': 'Feature extraction successful'
-        })
-        
-    except Exception as e:
-        logger.error(f"Error in extract-features endpoint: {e}")
         return jsonify({'error': str(e)}), 500
 
 @app.errorhandler(404)
@@ -462,8 +473,8 @@ def internal_error(error):
 if __name__ == '__main__':
     # Initialize the classifier
     try:
-        logger.info("🚀 Starting optimized classifier initialization...")
-        classifier = OptimizedCattleDiseaseClassifier()
+        logger.info("🚀 Starting multi-format classifier initialization...")
+        classifier = MultiFormatCattleDiseaseClassifier()
         if classifier.dataset_metadata:
             logger.info("✅ Classifier initialization completed successfully")
         else:

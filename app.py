@@ -21,9 +21,24 @@ CORS(app)  # Enable CORS for React Native
 
 class CattleDiseaseClassifier:
     def __init__(self, dataset_path='cattle_disease_features.json'):
+        # Get the absolute path to the dataset file
+        if not os.path.isabs(dataset_path):
+            # Get the directory where this script is located
+            script_dir = os.path.dirname(os.path.abspath(__file__))
+            dataset_path = os.path.join(script_dir, dataset_path)
+        
+        logger.info(f"Looking for dataset at: {dataset_path}")
+        logger.info(f"File exists: {os.path.exists(dataset_path)}")
+        logger.info(f"Current working directory: {os.getcwd()}")
+        logger.info(f"Files in current directory: {os.listdir('.')}")
+        
         # Load the feature extraction model
-        self.model = MobileNetV2(weights='imagenet', include_top=False, pooling='avg')
-        logger.info("MobileNetV2 model loaded successfully")
+        try:
+            self.model = MobileNetV2(weights='imagenet', include_top=False, pooling='avg')
+            logger.info("MobileNetV2 model loaded successfully")
+        except Exception as e:
+            logger.error(f"Error loading MobileNetV2 model: {e}")
+            raise
         
         # Load the dataset
         self.dataset = self.load_dataset(dataset_path)
@@ -32,9 +47,26 @@ class CattleDiseaseClassifier:
     def load_dataset(self, dataset_path):
         """Load the pre-computed features dataset"""
         try:
+            if not os.path.exists(dataset_path):
+                logger.error(f"Dataset file not found at: {dataset_path}")
+                logger.info("Available files in directory:")
+                try:
+                    for file in os.listdir(os.path.dirname(dataset_path) if os.path.dirname(dataset_path) else '.'):
+                        logger.info(f"  - {file}")
+                except:
+                    logger.info("  Could not list directory contents")
+                return []
+            
             with open(dataset_path, 'r', encoding='utf-8') as f:
                 dataset = json.load(f)
+            logger.info(f"Successfully loaded dataset with {len(dataset)} entries")
             return dataset
+        except FileNotFoundError:
+            logger.error(f"Dataset file not found: {dataset_path}")
+            return []
+        except json.JSONDecodeError as e:
+            logger.error(f"Error parsing JSON file: {e}")
+            return []
         except Exception as e:
             logger.error(f"Error loading dataset: {e}")
             return []
@@ -108,6 +140,10 @@ class CattleDiseaseClassifier:
     def classify_image(self, image_data):
         """Main classification function"""
         try:
+            if not self.dataset:
+                logger.error("No dataset available for classification")
+                return None
+                
             # Preprocess image
             img_array = self.preprocess_image(image_data)
             if img_array is None:
@@ -177,7 +213,9 @@ def health_check():
     return jsonify({
         'status': 'healthy',
         'model_loaded': classifier is not None,
-        'dataset_size': len(classifier.dataset) if classifier else 0
+        'dataset_size': len(classifier.dataset) if classifier else 0,
+        'current_directory': os.getcwd(),
+        'files_in_directory': os.listdir('.')
     })
 
 @app.route('/classify', methods=['POST'])
@@ -186,6 +224,9 @@ def classify_image():
     try:
         if classifier is None:
             return jsonify({'error': 'Model not loaded'}), 500
+            
+        if not classifier.dataset:
+            return jsonify({'error': 'No dataset available'}), 500
         
         # Get image data from request
         if 'image' not in request.files and 'image' not in request.json:
@@ -228,6 +269,9 @@ def get_classes():
     try:
         if classifier is None:
             return jsonify({'error': 'Model not loaded'}), 500
+            
+        if not classifier.dataset:
+            return jsonify({'error': 'No dataset available'}), 500
         
         classes = {}
         for item in classifier.dataset:
@@ -269,10 +313,14 @@ if __name__ == '__main__':
     # Initialize the classifier
     try:
         classifier = CattleDiseaseClassifier()
-        logger.info("Classifier initialized successfully")
+        if classifier.dataset:
+            logger.info("Classifier initialized successfully")
+        else:
+            logger.warning("Classifier initialized but no dataset loaded")
     except Exception as e:
         logger.error(f"Failed to initialize classifier: {e}")
-        exit(1)
+        # Don't exit, allow the server to start for debugging
+        classifier = None
     
     # Run the Flask app
     app.run(host='0.0.0.0', port=5000, debug=True)

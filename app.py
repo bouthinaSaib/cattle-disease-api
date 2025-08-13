@@ -1,6 +1,7 @@
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import json
+import gzip
 import numpy as np
 import tensorflow as tf
 from tensorflow.keras.applications import MobileNetV2
@@ -23,12 +24,23 @@ class CattleDiseaseClassifier:
     def __init__(self, dataset_path='cattle_disease_features.json'):
         # Get the absolute path to the dataset file
         if not os.path.isabs(dataset_path):
-            # Get the directory where this script is located
             script_dir = os.path.dirname(os.path.abspath(__file__))
             dataset_path = os.path.join(script_dir, dataset_path)
         
+        # Also check for compressed version
+        compressed_path = dataset_path + '.gz'
+        
         logger.info(f"Looking for dataset at: {dataset_path}")
-        logger.info(f"File exists: {os.path.exists(dataset_path)}")
+        logger.info(f"Looking for compressed dataset at: {compressed_path}")
+        logger.info(f"Regular file exists: {os.path.exists(dataset_path)}")
+        logger.info(f"Compressed file exists: {os.path.exists(compressed_path)}")
+        
+        if os.path.exists(dataset_path):
+            logger.info(f"Using regular file, size: {os.path.getsize(dataset_path)} bytes")
+        elif os.path.exists(compressed_path):
+            logger.info(f"Using compressed file, size: {os.path.getsize(compressed_path)} bytes")
+            dataset_path = compressed_path
+        
         logger.info(f"Current working directory: {os.getcwd()}")
         logger.info(f"Files in current directory: {os.listdir('.')}")
         
@@ -45,30 +57,135 @@ class CattleDiseaseClassifier:
         logger.info(f"Dataset loaded: {len(self.dataset)} entries")
         
     def load_dataset(self, dataset_path):
-        """Load the pre-computed features dataset"""
+        """Load the pre-computed features dataset (supports both regular and gzipped files)"""
         try:
             if not os.path.exists(dataset_path):
                 logger.error(f"Dataset file not found at: {dataset_path}")
                 logger.info("Available files in directory:")
                 try:
                     for file in os.listdir(os.path.dirname(dataset_path) if os.path.dirname(dataset_path) else '.'):
-                        logger.info(f"  - {file}")
-                except:
-                    logger.info("  Could not list directory contents")
+                        file_path = os.path.join(os.path.dirname(dataset_path) if os.path.dirname(dataset_path) else '.', file)
+                        size = os.path.getsize(file_path) if os.path.isfile(file_path) else 0
+                        logger.info(f"  - {file} ({size} bytes)")
+                except Exception as e:
+                    logger.info(f"  Could not list directory contents: {e}")
                 return []
             
-            with open(dataset_path, 'r', encoding='utf-8') as f:
-                dataset = json.load(f)
+            # Get file size for debugging
+            file_size = os.path.getsize(dataset_path)
+            logger.info(f"Dataset file size: {file_size} bytes ({file_size / 1024 / 1024:.2f} MB)")
+            
+            # Check if file is empty
+            if file_size == 0:
+                logger.error("Dataset file is empty!")
+                return []
+            
+            # Try to read first few bytes to check file format
+            try:
+                with open(dataset_path, 'rb') as f:
+                    first_bytes = f.read(100)
+                    logger.info(f"First 100 bytes: {first_bytes}")
+            except Exception as e:
+                logger.error(f"Could not read first bytes: {e}")
+            
+            # Check if file is gzipped
+            if dataset_path.endswith('.gz'):
+                logger.info("Loading compressed dataset...")
+                with gzip.open(dataset_path, 'rt', encoding='utf-8') as f:
+                    dataset = json.load(f)
+            else:
+                logger.info("Loading regular dataset...")
+                try:
+                    # For large files, try to optimize memory usage
+                    if file_size > 50 * 1024 * 1024:  # > 50MB
+                        logger.info("Large file detected, using optimized loading...")
+                        import gc
+                        gc.collect()  # Clear memory before loading
+                    
+                    with open(dataset_path, 'r', encoding='utf-8') as f:
+                        logger.info("File opened successfully, attempting to parse JSON...")
+                        
+                        # Read in chunks to detect encoding issues early
+                        test_chunk = f.read(1024)
+                        f.seek(0)  # Reset to beginning
+                        
+                        logger.info(f"Test chunk read successfully: {len(test_chunk)} chars")
+                        
+                        dataset = json.load(f)
+                        logger.info("JSON parsed successfully")
+                        
+                except UnicodeDecodeError as e:
+                    logger.error(f"Unicode decode error: {e}")
+                    logger.info("Trying with different encoding...")
+                    try:
+                        with open(dataset_path, 'r', encoding='latin-1') as f:
+                            dataset = json.load(f)
+                    except Exception as e2:
+                        logger.error(f"Failed with latin-1 encoding: {e2}")
+                        logger.info("Trying with utf-8-sig (BOM handling)...")
+                        with open(dataset_path, 'r', encoding='utf-8-sig') as f:
+                            dataset = json.load(f)
+                except MemoryError as e:
+                    logger.error(f"Memory error - file too large: {e}")
+                    logger.info("Try compressing the file or reducing dataset size")
+                    return []
+                except json.JSONDecodeError as e:
+                    logger.error(f"JSON decode error: {e}")
+                    # Try to fix common issues
+                    logger.info("Attempting to fix common JSON issues...")
+                    try:
+                        with open(dataset_path, 'r', encoding='utf-8') as f:
+                            content = f.read()
+                        
+                        # Remove BOM if present
+                        if content.startswith('\ufeff'):
+                            content = content[1:]
+                            logger.info("Removed BOM from file")
+                        
+                        # Try parsing the cleaned content
+                        dataset = json.loads(content)
+                        logger.info("Successfully parsed after cleaning")
+                    except Exception as fix_error:
+                        logger.error(f"Could not fix JSON: {fix_error}")
+                        raise e
+                    
             logger.info(f"Successfully loaded dataset with {len(dataset)} entries")
+            
+            # Validate dataset structure
+            if len(dataset) > 0:
+                first_item = dataset[0]
+                logger.info(f"First item keys: {list(first_item.keys())}")
+                required_keys = ['features', 'class']
+                missing_keys = [key for key in required_keys if key not in first_item]
+                if missing_keys:
+                    logger.warning(f"Missing required keys in dataset: {missing_keys}")
+                else:
+                    logger.info("Dataset structure validation passed")
+            
             return dataset
+            
         except FileNotFoundError:
             logger.error(f"Dataset file not found: {dataset_path}")
             return []
         except json.JSONDecodeError as e:
-            logger.error(f"Error parsing JSON file: {e}")
+            logger.error(f"JSON decode error: {e}")
+            logger.error(f"Error at line {e.lineno}, column {e.colno}: {e.msg}")
+            # Try to read a small sample to see what's wrong
+            try:
+                with open(dataset_path, 'r', encoding='utf-8') as f:
+                    sample = f.read(1000)
+                    logger.info(f"First 1000 characters: {sample}")
+            except:
+                pass
+            return []
+        except MemoryError as e:
+            logger.error(f"Memory error - file too large to load: {e}")
             return []
         except Exception as e:
-            logger.error(f"Error loading dataset: {e}")
+            logger.error(f"Unexpected error loading dataset: {e}")
+            logger.error(f"Error type: {type(e).__name__}")
+            import traceback
+            logger.error(f"Traceback: {traceback.format_exc()}")
             return []
     
     def preprocess_image(self, image_data):
@@ -210,12 +327,21 @@ classifier = None
 @app.route('/health', methods=['GET'])
 def health_check():
     """Health check endpoint"""
+    file_info = []
+    try:
+        for file in os.listdir('.'):
+            if os.path.isfile(file):
+                size = os.path.getsize(file)
+                file_info.append(f"{file} ({size} bytes)")
+    except:
+        file_info = ["Could not list files"]
+        
     return jsonify({
         'status': 'healthy',
-        'model_loaded': classifier is not None,
+        'model_loaded': classifier is not None and classifier.model is not None,
         'dataset_size': len(classifier.dataset) if classifier else 0,
         'current_directory': os.getcwd(),
-        'files_in_directory': os.listdir('.')
+        'files_in_directory': file_info
     })
 
 @app.route('/classify', methods=['POST'])
@@ -319,7 +445,6 @@ if __name__ == '__main__':
             logger.warning("Classifier initialized but no dataset loaded")
     except Exception as e:
         logger.error(f"Failed to initialize classifier: {e}")
-        # Don't exit, allow the server to start for debugging
         classifier = None
     
     # Run the Flask app

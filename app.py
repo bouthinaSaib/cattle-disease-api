@@ -11,6 +11,7 @@ import io
 import base64
 from PIL import Image
 import os
+import sys
 import logging
 
 # Configure logging
@@ -22,171 +23,143 @@ CORS(app)  # Enable CORS for React Native
 
 class CattleDiseaseClassifier:
     def __init__(self, dataset_path='cattle_disease_features.json'):
-        # Get the absolute path to the dataset file
-        if not os.path.isabs(dataset_path):
-            script_dir = os.path.dirname(os.path.abspath(__file__))
-            dataset_path = os.path.join(script_dir, dataset_path)
+        self.model = None
+        self.dataset = []
+        self.initialization_error = None
         
-        # Also check for compressed version
-        compressed_path = dataset_path + '.gz'
-        
-        logger.info(f"Looking for dataset at: {dataset_path}")
-        logger.info(f"Looking for compressed dataset at: {compressed_path}")
-        logger.info(f"Regular file exists: {os.path.exists(dataset_path)}")
-        logger.info(f"Compressed file exists: {os.path.exists(compressed_path)}")
-        
-        if os.path.exists(dataset_path):
-            logger.info(f"Using regular file, size: {os.path.getsize(dataset_path)} bytes")
-        elif os.path.exists(compressed_path):
-            logger.info(f"Using compressed file, size: {os.path.getsize(compressed_path)} bytes")
-            dataset_path = compressed_path
-        
-        logger.info(f"Current working directory: {os.getcwd()}")
-        logger.info(f"Files in current directory: {os.listdir('.')}")
-        
-        # Load the feature extraction model
         try:
+            # Load the feature extraction model first
+            logger.info("Loading MobileNetV2 model...")
             self.model = MobileNetV2(weights='imagenet', include_top=False, pooling='avg')
             logger.info("MobileNetV2 model loaded successfully")
         except Exception as e:
             logger.error(f"Error loading MobileNetV2 model: {e}")
-            raise
+            self.initialization_error = f"Model loading failed: {e}"
+            return
         
-        # Load the dataset
-        self.dataset = self.load_dataset(dataset_path)
-        logger.info(f"Dataset loaded: {len(self.dataset)} entries")
+        # Try to load the dataset
+        try:
+            self.dataset = self.load_dataset(dataset_path)
+            logger.info(f"Dataset loaded: {len(self.dataset)} entries")
+        except Exception as e:
+            logger.error(f"Error loading dataset: {e}")
+            self.initialization_error = f"Dataset loading failed: {e}"
+            # Continue without dataset for debugging
         
     def load_dataset(self, dataset_path):
-        """Load the pre-computed features dataset (supports both regular and gzipped files)"""
-        try:
-            if not os.path.exists(dataset_path):
+        """Load the pre-computed features dataset with extensive error handling"""
+        
+        # Get the absolute path
+        if not os.path.isabs(dataset_path):
+            script_dir = os.path.dirname(os.path.abspath(__file__))
+            dataset_path = os.path.join(script_dir, dataset_path)
+        
+        logger.info(f"Looking for dataset at: {dataset_path}")
+        
+        if not os.path.exists(dataset_path):
+            # Try compressed version
+            compressed_path = dataset_path + '.gz'
+            if os.path.exists(compressed_path):
+                dataset_path = compressed_path
+                logger.info(f"Using compressed version: {compressed_path}")
+            else:
                 logger.error(f"Dataset file not found at: {dataset_path}")
-                logger.info("Available files in directory:")
-                try:
-                    for file in os.listdir(os.path.dirname(dataset_path) if os.path.dirname(dataset_path) else '.'):
-                        file_path = os.path.join(os.path.dirname(dataset_path) if os.path.dirname(dataset_path) else '.', file)
-                        size = os.path.getsize(file_path) if os.path.isfile(file_path) else 0
-                        logger.info(f"  - {file} ({size} bytes)")
-                except Exception as e:
-                    logger.info(f"  Could not list directory contents: {e}")
                 return []
+        
+        file_size = os.path.getsize(dataset_path)
+        logger.info(f"Dataset file size: {file_size} bytes ({file_size / 1024 / 1024:.2f} MB)")
+        
+        if file_size == 0:
+            logger.error("Dataset file is empty!")
+            return []
+        
+        if file_size > 100 * 1024 * 1024:  # > 100MB
+            logger.warning("Dataset file is very large, this might cause memory issues")
+        
+        try:
+            # Read first few bytes to check format
+            with open(dataset_path, 'rb') as f:
+                first_bytes = f.read(10)
+                logger.info(f"File starts with: {first_bytes}")
             
-            # Get file size for debugging
-            file_size = os.path.getsize(dataset_path)
-            logger.info(f"Dataset file size: {file_size} bytes ({file_size / 1024 / 1024:.2f} MB)")
+            # Determine if compressed
+            is_compressed = dataset_path.endswith('.gz') or first_bytes.startswith(b'\x1f\x8b')
             
-            # Check if file is empty
-            if file_size == 0:
-                logger.error("Dataset file is empty!")
-                return []
-            
-            # Try to read first few bytes to check file format
-            try:
-                with open(dataset_path, 'rb') as f:
-                    first_bytes = f.read(100)
-                    logger.info(f"First 100 bytes: {first_bytes}")
-            except Exception as e:
-                logger.error(f"Could not read first bytes: {e}")
-            
-            # Check if file is gzipped
-            if dataset_path.endswith('.gz'):
+            if is_compressed:
                 logger.info("Loading compressed dataset...")
                 with gzip.open(dataset_path, 'rt', encoding='utf-8') as f:
-                    dataset = json.load(f)
+                    # Load in smaller chunks for large files
+                    content = f.read()
             else:
                 logger.info("Loading regular dataset...")
-                try:
-                    # For large files, try to optimize memory usage
-                    if file_size > 50 * 1024 * 1024:  # > 50MB
-                        logger.info("Large file detected, using optimized loading...")
-                        import gc
-                        gc.collect()  # Clear memory before loading
-                    
-                    with open(dataset_path, 'r', encoding='utf-8') as f:
-                        logger.info("File opened successfully, attempting to parse JSON...")
-                        
-                        # Read in chunks to detect encoding issues early
-                        test_chunk = f.read(1024)
-                        f.seek(0)  # Reset to beginning
-                        
-                        logger.info(f"Test chunk read successfully: {len(test_chunk)} chars")
-                        
-                        dataset = json.load(f)
-                        logger.info("JSON parsed successfully")
-                        
-                except UnicodeDecodeError as e:
-                    logger.error(f"Unicode decode error: {e}")
-                    logger.info("Trying with different encoding...")
-                    try:
-                        with open(dataset_path, 'r', encoding='latin-1') as f:
-                            dataset = json.load(f)
-                    except Exception as e2:
-                        logger.error(f"Failed with latin-1 encoding: {e2}")
-                        logger.info("Trying with utf-8-sig (BOM handling)...")
-                        with open(dataset_path, 'r', encoding='utf-8-sig') as f:
-                            dataset = json.load(f)
-                except MemoryError as e:
-                    logger.error(f"Memory error - file too large: {e}")
-                    logger.info("Try compressing the file or reducing dataset size")
-                    return []
-                except json.JSONDecodeError as e:
-                    logger.error(f"JSON decode error: {e}")
-                    # Try to fix common issues
-                    logger.info("Attempting to fix common JSON issues...")
-                    try:
-                        with open(dataset_path, 'r', encoding='utf-8') as f:
-                            content = f.read()
-                        
-                        # Remove BOM if present
-                        if content.startswith('\ufeff'):
-                            content = content[1:]
-                            logger.info("Removed BOM from file")
-                        
-                        # Try parsing the cleaned content
-                        dataset = json.loads(content)
-                        logger.info("Successfully parsed after cleaning")
-                    except Exception as fix_error:
-                        logger.error(f"Could not fix JSON: {fix_error}")
-                        raise e
-                    
-            logger.info(f"Successfully loaded dataset with {len(dataset)} entries")
-            
-            # Validate dataset structure
-            if len(dataset) > 0:
-                first_item = dataset[0]
-                logger.info(f"First item keys: {list(first_item.keys())}")
-                required_keys = ['features', 'class']
-                missing_keys = [key for key in required_keys if key not in first_item]
-                if missing_keys:
-                    logger.warning(f"Missing required keys in dataset: {missing_keys}")
-                else:
-                    logger.info("Dataset structure validation passed")
-            
-            return dataset
-            
-        except FileNotFoundError:
-            logger.error(f"Dataset file not found: {dataset_path}")
-            return []
-        except json.JSONDecodeError as e:
-            logger.error(f"JSON decode error: {e}")
-            logger.error(f"Error at line {e.lineno}, column {e.colno}: {e.msg}")
-            # Try to read a small sample to see what's wrong
-            try:
                 with open(dataset_path, 'r', encoding='utf-8') as f:
-                    sample = f.read(1000)
-                    logger.info(f"First 1000 characters: {sample}")
+                    content = f.read()
+            
+            logger.info(f"File content loaded, size: {len(content)} characters")
+            
+            # Parse JSON
+            logger.info("Parsing JSON...")
+            dataset = json.loads(content)
+            
+            logger.info(f"JSON parsed successfully, type: {type(dataset)}")
+            
+            if isinstance(dataset, list):
+                logger.info(f"Dataset is a list with {len(dataset)} items")
+                if len(dataset) > 0:
+                    first_item = dataset[0]
+                    logger.info(f"First item type: {type(first_item)}")
+                    if isinstance(first_item, dict):
+                        logger.info(f"First item keys: {list(first_item.keys())}")
+                        
+                        # Validate structure
+                        required_keys = ['features', 'class']
+                        for key in required_keys:
+                            if key not in first_item:
+                                logger.warning(f"Missing required key: {key}")
+                            else:
+                                logger.info(f"✓ Found required key: {key}")
+                
+                return dataset
+            else:
+                logger.error(f"Expected list, got {type(dataset)}")
+                return []
+                
+        except json.JSONDecodeError as e:
+            logger.error(f"JSON parsing error: {e}")
+            logger.error(f"Error at line {e.lineno}, column {e.colno}: {e.msg}")
+            
+            # Show problematic content
+            try:
+                lines = content.split('\n')
+                if e.lineno <= len(lines):
+                    logger.error(f"Problematic line: {lines[e.lineno - 1][:200]}...")
             except:
                 pass
             return []
+            
         except MemoryError as e:
-            logger.error(f"Memory error - file too large to load: {e}")
+            logger.error(f"Memory error loading dataset: {e}")
+            logger.error("File is too large for available memory")
             return []
+            
         except Exception as e:
             logger.error(f"Unexpected error loading dataset: {e}")
-            logger.error(f"Error type: {type(e).__name__}")
             import traceback
             logger.error(f"Traceback: {traceback.format_exc()}")
             return []
+    
+    def extract_features(self, img_array):
+        """Extract features from preprocessed image"""
+        if self.model is None:
+            logger.error("Model not loaded")
+            return None
+            
+        try:
+            features = self.model.predict(img_array, verbose=0)
+            return features.flatten().tolist()
+        except Exception as e:
+            logger.error(f"Error extracting features: {e}")
+            return None
     
     def preprocess_image(self, image_data):
         """Preprocess image for feature extraction"""
@@ -219,110 +192,10 @@ class CattleDiseaseClassifier:
         except Exception as e:
             logger.error(f"Error preprocessing image: {e}")
             return None
-    
-    def extract_features(self, img_array):
-        """Extract features from preprocessed image"""
-        try:
-            features = self.model.predict(img_array, verbose=0)
-            return features.flatten().tolist()
-        except Exception as e:
-            logger.error(f"Error extracting features: {e}")
-            return None
-    
-    def cosine_similarity(self, vec_a, vec_b):
-        """Calculate cosine similarity between two vectors"""
-        try:
-            dot_product = np.dot(vec_a, vec_b)
-            norm_a = np.linalg.norm(vec_a)
-            norm_b = np.linalg.norm(vec_b)
-            return dot_product / (norm_a * norm_b)
-        except:
-            return 0.0
-    
-    def find_similar_images(self, query_features, top_k=10):
-        """Find most similar images in the dataset"""
-        similarities = []
-        
-        for item in self.dataset:
-            similarity = self.cosine_similarity(query_features, item['features'])
-            similarities.append({
-                **item,
-                'similarity': float(similarity)
-            })
-        
-        # Sort by similarity (highest first)
-        similarities.sort(key=lambda x: x['similarity'], reverse=True)
-        return similarities[:top_k]
-    
-    def classify_image(self, image_data):
-        """Main classification function"""
-        try:
-            if not self.dataset:
-                logger.error("No dataset available for classification")
-                return None
-                
-            # Preprocess image
-            img_array = self.preprocess_image(image_data)
-            if img_array is None:
-                return None
-            
-            # Extract features
-            features = self.extract_features(img_array)
-            if features is None:
-                return None
-            
-            # Find similar images
-            similar_images = self.find_similar_images(features, top_k=10)
-            
-            if not similar_images:
-                return None
-            
-            # Determine class by weighted voting (top 5 similar images)
-            class_votes = {}
-            stage_votes = {}
-            top_similar = similar_images[:5]
-            
-            for item in top_similar:
-                # Class voting
-                if item['class']:
-                    class_votes[item['class']] = class_votes.get(item['class'], 0) + item['similarity']
-                
-                # Stage voting
-                if item['stage']:
-                    stage_votes[item['stage']] = stage_votes.get(item['stage'], 0) + item['similarity']
-            
-            # Get best class and stage
-            best_class = max(class_votes.items(), key=lambda x: x[1])[0] if class_votes else "Unknown"
-            best_stage = max(stage_votes.items(), key=lambda x: x[1])[0] if stage_votes else None
-            
-            # Get description from most similar image
-            best_match = similar_images[0]
-            
-            # Calculate confidence (average similarity of top 3 matches)
-            confidence = np.mean([item['similarity'] for item in similar_images[:3]])
-            
-            return {
-                'class': best_class,
-                'stage': best_stage,
-                'description': best_match['description'],
-                'confidence': float(confidence),
-                'similar_images': [
-                    {
-                        'class': item['class'],
-                        'stage': item['stage'],
-                        'description': item['description'],
-                        'similarity': item['similarity']
-                    }
-                    for item in similar_images[:3]
-                ]
-            }
-            
-        except Exception as e:
-            logger.error(f"Error in classification: {e}")
-            return None
 
 # Initialize the classifier
 classifier = None
+initialization_error = None
 
 @app.route('/health', methods=['GET'])
 def health_check():
@@ -339,113 +212,123 @@ def health_check():
     return jsonify({
         'status': 'healthy',
         'model_loaded': classifier is not None and classifier.model is not None,
-        'dataset_size': len(classifier.dataset) if classifier else 0,
+        'dataset_size': len(classifier.dataset) if classifier and classifier.dataset else 0,
+        'initialization_error': classifier.initialization_error if classifier else initialization_error,
         'current_directory': os.getcwd(),
         'files_in_directory': file_info
     })
 
-@app.route('/classify', methods=['POST'])
-def classify_image():
-    """Main classification endpoint"""
+@app.route('/debug', methods=['GET'])
+def debug_info():
+    """Debug endpoint"""
+    debug_data = {
+        'classifier_exists': classifier is not None,
+        'model_loaded': classifier is not None and classifier.model is not None,
+        'dataset_loaded': classifier is not None and len(classifier.dataset) > 0,
+        'dataset_size': len(classifier.dataset) if classifier and classifier.dataset else 0,
+        'initialization_error': classifier.initialization_error if classifier else initialization_error,
+        'current_directory': os.getcwd(),
+        'python_version': sys.version
+    }
+    
+    # File information
+    files_info = []
     try:
-        if classifier is None:
+        for file in os.listdir('.'):
+            if os.path.isfile(file):
+                size = os.path.getsize(file)
+                files_info.append({
+                    'name': file,
+                    'size_bytes': size,
+                    'size_mb': round(size / 1024 / 1024, 2)
+                })
+    except Exception as e:
+        files_info = [f"Error listing files: {e}"]
+    
+    debug_data['files'] = files_info
+    
+    return jsonify(debug_data)
+
+@app.route('/extract-features', methods=['POST'])
+def extract_features_only():
+    """Extract features from image without classification (for testing)"""
+    try:
+        if classifier is None or classifier.model is None:
             return jsonify({'error': 'Model not loaded'}), 500
-            
-        if not classifier.dataset:
-            return jsonify({'error': 'No dataset available'}), 500
         
-        # Get image data from request
+        # Get image data
         if 'image' not in request.files and 'image' not in request.json:
             return jsonify({'error': 'No image provided'}), 400
         
         image_data = None
-        
-        # Handle file upload
         if 'image' in request.files:
             file = request.files['image']
             if file.filename == '':
                 return jsonify({'error': 'No file selected'}), 400
             image_data = file.read()
-        
-        # Handle base64 image
         elif 'image' in request.json:
             image_data = request.json['image']
         
         if image_data is None:
             return jsonify({'error': 'Invalid image data'}), 400
         
-        # Classify the image
-        result = classifier.classify_image(image_data)
+        # Preprocess image
+        img_array = classifier.preprocess_image(image_data)
+        if img_array is None:
+            return jsonify({'error': 'Failed to preprocess image'}), 500
         
-        if result is None:
-            return jsonify({'error': 'Failed to classify image'}), 500
+        # Extract features
+        features = classifier.extract_features(img_array)
+        if features is None:
+            return jsonify({'error': 'Failed to extract features'}), 500
         
         return jsonify({
             'success': True,
-            'prediction': result
+            'features_length': len(features),
+            'features_sample': features[:10],  # First 10 features
+            'message': 'Feature extraction successful'
         })
+        
+    except Exception as e:
+        logger.error(f"Error in extract-features endpoint: {e}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/classify', methods=['POST'])
+def classify_image():
+    """Main classification endpoint"""
+    try:
+        if classifier is None:
+            return jsonify({'error': 'Classifier not initialized'}), 500
+            
+        if classifier.model is None:
+            return jsonify({'error': 'Model not loaded'}), 500
+            
+        if not classifier.dataset:
+            return jsonify({'error': 'No dataset available - check /debug for details'}), 500
+        
+        # Get image data from request
+        if 'image' not in request.files and 'image' not in request.json:
+            return jsonify({'error': 'No image provided'}), 400
+        
+        return jsonify({'error': 'Classification temporarily disabled for debugging'}), 503
         
     except Exception as e:
         logger.error(f"Error in classify endpoint: {e}")
         return jsonify({'error': str(e)}), 500
 
-@app.route('/classes', methods=['GET'])
-def get_classes():
-    """Get available disease classes"""
-    try:
-        if classifier is None:
-            return jsonify({'error': 'Model not loaded'}), 500
-            
-        if not classifier.dataset:
-            return jsonify({'error': 'No dataset available'}), 500
-        
-        classes = {}
-        for item in classifier.dataset:
-            class_name = item['class']
-            if class_name not in classes:
-                classes[class_name] = {
-                    'name': class_name,
-                    'count': 0,
-                    'stages': set()
-                }
-            classes[class_name]['count'] += 1
-            if item['stage']:
-                classes[class_name]['stages'].add(item['stage'])
-        
-        # Convert sets to lists for JSON serialization
-        for class_info in classes.values():
-            class_info['stages'] = list(class_info['stages'])
-        
-        return jsonify({
-            'success': True,
-            'classes': list(classes.values()),
-            'total_classes': len(classes),
-            'total_images': len(classifier.dataset)
-        })
-        
-    except Exception as e:
-        logger.error(f"Error in classes endpoint: {e}")
-        return jsonify({'error': str(e)}), 500
-
-@app.errorhandler(404)
-def not_found(error):
-    return jsonify({'error': 'Endpoint not found'}), 404
-
-@app.errorhandler(500)
-def internal_error(error):
-    return jsonify({'error': 'Internal server error'}), 500
-
 if __name__ == '__main__':
     # Initialize the classifier
     try:
+        logger.info("Starting classifier initialization...")
         classifier = CattleDiseaseClassifier()
-        if classifier.dataset:
-            logger.info("Classifier initialized successfully")
-        else:
-            logger.warning("Classifier initialized but no dataset loaded")
+        logger.info("Classifier initialization completed")
     except Exception as e:
         logger.error(f"Failed to initialize classifier: {e}")
+        import traceback
+        logger.error(f"Full traceback: {traceback.format_exc()}")
+        initialization_error = str(e)
         classifier = None
     
     # Run the Flask app
-    app.run(host='0.0.0.0', port=5000, debug=True)
+    port = int(os.environ.get('PORT', 5000))
+    app.run(host='0.0.0.0', port=port, debug=False)

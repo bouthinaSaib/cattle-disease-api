@@ -39,42 +39,56 @@ def safe_json_response(data, status=200):
             'message': str(e)
         }), 500
 
-def load_saved_model():
-    """Load pre-saved TensorFlow model"""
+def load_model_from_weights():
+    """Load model by reconstructing architecture and loading weights"""
     global app_state
     
     if app_state['model_loaded']:
         return True
     
     try:
-        # Look for saved model files
-        model_paths = [
-            'mobilenetv2_model.keras',
-            'mobilenetv2_model.h5',
-            'mobilenetv2_model',  # folder format
-            'model.keras',
-            'model.h5',
-            'saved_model'
+        logger.info("🔄 Starting model loading from weights...")
+        
+        # Look for weights file
+        weights_files = [
+            'mobilenetv2.weights.h5',
+            'model_weights.h5',
+            'weights.h5'
         ]
         
-        model_path = None
-        for path in model_paths:
+        weights_path = None
+        for path in weights_files:
             if os.path.exists(path):
-                model_path = path
+                weights_path = path
+                logger.info(f"📁 Found weights file: {path}")
                 break
         
-        if not model_path:
-            logger.error("❌ No saved model found")
-            app_state['error'] = "No saved model found"
+        if not weights_path:
+            available_files = [f for f in os.listdir('.') if os.path.isfile(f)]
+            logger.error(f"❌ No weights file found")
+            logger.error(f"❌ Available files: {available_files}")
+            app_state['error'] = "No model weights found"
             return False
         
-        logger.info(f"🔄 Loading saved model from: {model_path}")
+        # Check file size
+        file_size = os.path.getsize(weights_path)
+        logger.info(f"📊 Weights file size: {file_size / 1024 / 1024:.1f} MB")
         
+        # Import TensorFlow
+        logger.info("🔄 Importing TensorFlow...")
         import tensorflow as tf
+        from tensorflow.keras.applications import MobileNetV2
         from tensorflow.keras.applications.mobilenet_v2 import preprocess_input
         
-        # Load the saved model
-        model = tf.keras.models.load_model(model_path)
+        logger.info(f"📊 TensorFlow version: {tf.__version__}")
+        
+        # Create model architecture (without pre-trained weights)
+        logger.info("🔄 Creating model architecture...")
+        model = MobileNetV2(weights=None, include_top=False, pooling='avg')
+        
+        # Load the saved weights
+        logger.info(f"🔄 Loading weights from: {weights_path}")
+        model.load_weights(weights_path)
         
         # Store in global state
         app_state['model'] = model
@@ -83,16 +97,23 @@ def load_saved_model():
         app_state['model_loaded'] = True
         app_state['tf_available'] = True
         
-        logger.info("✅ Saved model loaded successfully!")
+        logger.info("✅ Model loaded successfully from weights!")
         logger.info(f"📊 Model input shape: {model.input_shape}")
         logger.info(f"📊 Model output shape: {model.output_shape}")
+        
+        # Test the model with dummy input
+        logger.info("🧪 Testing model with dummy input...")
+        test_input = np.random.rand(1, 224, 224, 3).astype(np.float32)
+        test_output = model.predict(test_input, verbose=0)
+        logger.info(f"✅ Model test successful, output shape: {test_output.shape}")
         
         gc.collect()
         return True
         
     except Exception as e:
-        logger.error(f"❌ Error loading saved model: {e}")
-        logger.error(f"Traceback: {traceback.format_exc()}")
+        logger.error(f"❌ Error loading model from weights: {e}")
+        logger.error(f"❌ Error type: {type(e).__name__}")
+        logger.error(f"❌ Traceback: {traceback.format_exc()}")
         app_state['error'] = f"Model loading failed: {e}"
         return False
 
@@ -204,8 +225,8 @@ def preprocess_image_safe(image_data):
         if app_state.get('preprocess_input'):
             img_array = app_state['preprocess_input'](img_array)
         else:
-            # Fallback preprocessing
-            img_array = (img_array / 255.0 - 0.5) * 2
+            # Fallback preprocessing for MobileNetV2
+            img_array = (img_array / 127.5) - 1.0  # Scale to [-1, 1]
         
         return img_array
         
@@ -214,25 +235,51 @@ def preprocess_image_safe(image_data):
         return None
 
 def extract_features_safe(img_array):
-    """Safe feature extraction"""
+    """Safe feature extraction with detailed error reporting"""
     try:
+        logger.info("🔄 Starting feature extraction...")
+        
         if not app_state['model_loaded']:
             logger.info("🔄 Model not loaded, attempting to load...")
-            if not load_saved_model():
+            if not load_model_from_weights():
+                logger.error("❌ Failed to load model for feature extraction")
                 return None
         
+        logger.info("🔄 Model is loaded, proceeding with prediction...")
         model = app_state['model']
+        
+        # Validate input
+        logger.info(f"📊 Input shape: {img_array.shape}")
+        logger.info(f"📊 Input dtype: {img_array.dtype}")
+        logger.info(f"📊 Input range: [{np.min(img_array):.3f}, {np.max(img_array):.3f}]")
+        
+        # Predict features
+        logger.info("🔄 Running model prediction...")
         features = model.predict(img_array, verbose=0)
+        
+        logger.info(f"📊 Features shape: {features.shape}")
+        logger.info(f"📊 Features dtype: {features.dtype}")
+        
+        # Flatten and convert
         result = features.flatten().astype(np.float32)
+        logger.info(f"📊 Final features shape: {result.shape}")
+        
+        # Validate output
+        if np.any(np.isnan(result)) or np.any(np.isinf(result)):
+            logger.error("❌ Features contain NaN or Inf values")
+            return None
         
         # Cleanup
         del features
         gc.collect()
         
+        logger.info("✅ Feature extraction successful")
         return result
         
     except Exception as e:
         logger.error(f"❌ Feature extraction error: {e}")
+        logger.error(f"❌ Error type: {type(e).__name__}")
+        logger.error(f"❌ Traceback: {traceback.format_exc()}")
         return None
 
 def find_similar_images_safe(query_features, top_k=5):
@@ -278,7 +325,7 @@ def find_similar_images_safe(query_features, top_k=5):
         logger.error(f"❌ Similarity search error: {e}")
         return []
 
-# Load dataset on startup (but not model - load on demand)
+# Load dataset on startup
 load_dataset()
 
 @app.route('/health', methods=['GET'])
@@ -291,15 +338,6 @@ def health_check():
                 if os.path.isfile(file):
                     size = os.path.getsize(file)
                     files_info.append(f"{file} ({size} bytes)")
-                elif os.path.isdir(file):
-                    # Check if it's a model directory
-                    try:
-                        dir_size = sum(os.path.getsize(os.path.join(file, f)) 
-                                     for f in os.listdir(file) 
-                                     if os.path.isfile(os.path.join(file, f)))
-                        files_info.append(f"{file}/ (directory, {dir_size} bytes)")
-                    except:
-                        files_info.append(f"{file}/ (directory)")
         except:
             files_info = ["Could not list files"]
         
@@ -324,33 +362,46 @@ def health_check():
             'server_working': True
         }, 500)
 
-@app.route('/load-model', methods=['POST'])
-def load_model_endpoint():
-    """Manually trigger model loading"""
+@app.route('/test-model', methods=['POST'])
+def test_model():
+    """Test model loading and basic prediction"""
     try:
-        if app_state['model_loaded']:
-            return safe_json_response({
-                'message': 'Model already loaded',
-                'model_loaded': True
-            })
+        # Try to load model if not loaded
+        if not app_state['model_loaded']:
+            logger.info("🔄 Attempting to load model for testing...")
+            success = load_model_from_weights()
+            if not success:
+                return safe_json_response({
+                    'error': 'Model loading failed',
+                    'details': app_state.get('error')
+                }, 500)
         
-        success = load_saved_model()
+        # Create a dummy image for testing
+        logger.info("🔄 Creating test image...")
+        test_image = np.random.rand(1, 224, 224, 3).astype(np.float32)
         
-        if success:
-            return safe_json_response({
-                'message': 'Model loaded successfully',
-                'model_loaded': True,
-                'tf_available': app_state['tf_available']
-            })
-        else:
-            return safe_json_response({
-                'error': 'Failed to load model',
-                'details': app_state['error']
-            }, 500)
-            
-    except Exception as e:
+        # Preprocess using our function
+        test_image = (test_image / 127.5) - 1.0  # MobileNetV2 preprocessing
+        
+        # Test model prediction
+        logger.info("🔄 Testing model prediction...")
+        model = app_state['model']
+        features = model.predict(test_image, verbose=0)
+        
         return safe_json_response({
-            'error': f'Model loading failed: {str(e)}'
+            'success': True,
+            'model_loaded': True,
+            'test_features_shape': features.shape,
+            'test_features_sample': features.flatten()[:5].tolist(),
+            'message': 'Model test successful'
+        })
+        
+    except Exception as e:
+        logger.error(f"❌ Model test error: {e}")
+        logger.error(f"Traceback: {traceback.format_exc()}")
+        return safe_json_response({
+            'error': f'Model test failed: {str(e)}',
+            'traceback': traceback.format_exc()
         }, 500)
 
 @app.route('/classify', methods=['POST', 'OPTIONS'])

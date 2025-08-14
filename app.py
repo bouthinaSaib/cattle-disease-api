@@ -39,41 +39,65 @@ def safe_json_response(data, status=200):
             'message': str(e)
         }), 500
 
-def load_tensorflow_model():
-    """Load TensorFlow model safely"""
+def load_saved_model():
+    """Load pre-saved TensorFlow model"""
     global app_state
     
     if app_state['model_loaded']:
         return True
     
     try:
-        logger.info("🔄 Loading TensorFlow model...")
+        # Look for saved model files
+        model_paths = [
+            'mobilenetv2_model.keras',
+            'mobilenetv2_model.h5',
+            'mobilenetv2_model',  # folder format
+            'model.keras',
+            'model.h5',
+            'saved_model'
+        ]
+        
+        model_path = None
+        for path in model_paths:
+            if os.path.exists(path):
+                model_path = path
+                break
+        
+        if not model_path:
+            logger.error("❌ No saved model found")
+            app_state['error'] = "No saved model found"
+            return False
+        
+        logger.info(f"🔄 Loading saved model from: {model_path}")
         
         import tensorflow as tf
-        from tensorflow.keras.applications import MobileNetV2
         from tensorflow.keras.applications.mobilenet_v2 import preprocess_input
         
-        # Store TensorFlow modules globally
+        # Load the saved model
+        model = tf.keras.models.load_model(model_path)
+        
+        # Store in global state
+        app_state['model'] = model
         app_state['tf'] = tf
         app_state['preprocess_input'] = preprocess_input
-        
-        # Load model
-        model = MobileNetV2(weights='imagenet', include_top=False, pooling='avg')
-        app_state['model'] = model
         app_state['model_loaded'] = True
         app_state['tf_available'] = True
         
-        logger.info("✅ TensorFlow model loaded successfully")
+        logger.info("✅ Saved model loaded successfully!")
+        logger.info(f"📊 Model input shape: {model.input_shape}")
+        logger.info(f"📊 Model output shape: {model.output_shape}")
+        
         gc.collect()
         return True
         
     except Exception as e:
-        logger.error(f"❌ TensorFlow loading failed: {e}")
-        app_state['error'] = f"TensorFlow error: {e}"
+        logger.error(f"❌ Error loading saved model: {e}")
+        logger.error(f"Traceback: {traceback.format_exc()}")
+        app_state['error'] = f"Model loading failed: {e}"
         return False
 
 def load_dataset():
-    """Load dataset safely"""
+    """Load dataset from text file"""
     global app_state
     
     try:
@@ -89,7 +113,7 @@ def load_dataset():
             app_state['error'] = 'No dataset file found'
             return
         
-        logger.info(f"Loading dataset from: {dataset_file}")
+        logger.info(f"📁 Loading dataset from: {dataset_file}")
         
         features_list = []
         metadata_list = []
@@ -131,8 +155,9 @@ def load_dataset():
                         'index': len(features_list) - 1
                     })
                     
-                    # Limit dataset size
+                    # Limit dataset size for memory
                     if len(features_list) >= 200:
+                        logger.info("📊 Limited dataset to 200 entries")
                         break
                     
                 except Exception:
@@ -143,12 +168,12 @@ def load_dataset():
             app_state['metadata'] = metadata_list
             app_state['dataset_loaded'] = True
             app_state['dataset_size'] = len(metadata_list)
-            logger.info(f"Dataset loaded: {len(metadata_list)} entries")
+            logger.info(f"✅ Dataset loaded: {len(metadata_list)} entries")
         else:
             app_state['error'] = 'No valid entries found'
     
     except Exception as e:
-        logger.error(f"Dataset loading error: {e}")
+        logger.error(f"❌ Dataset loading error: {e}")
         app_state['error'] = str(e)
 
 def preprocess_image_safe(image_data):
@@ -175,24 +200,25 @@ def preprocess_image_safe(image_data):
         img_array = np.array(img, dtype=np.float32)
         img_array = np.expand_dims(img_array, axis=0)
         
-        # Preprocess
+        # Use TensorFlow preprocessing if available
         if app_state.get('preprocess_input'):
             img_array = app_state['preprocess_input'](img_array)
         else:
-            # Simple normalization if TensorFlow not available
+            # Fallback preprocessing
             img_array = (img_array / 255.0 - 0.5) * 2
         
         return img_array
         
     except Exception as e:
-        logger.error(f"Image preprocessing error: {e}")
+        logger.error(f"❌ Image preprocessing error: {e}")
         return None
 
 def extract_features_safe(img_array):
     """Safe feature extraction"""
     try:
         if not app_state['model_loaded']:
-            if not load_tensorflow_model():
+            logger.info("🔄 Model not loaded, attempting to load...")
+            if not load_saved_model():
                 return None
         
         model = app_state['model']
@@ -206,7 +232,7 @@ def extract_features_safe(img_array):
         return result
         
     except Exception as e:
-        logger.error(f"Feature extraction error: {e}")
+        logger.error(f"❌ Feature extraction error: {e}")
         return None
 
 def find_similar_images_safe(query_features, top_k=5):
@@ -249,10 +275,10 @@ def find_similar_images_safe(query_features, top_k=5):
         return results
         
     except Exception as e:
-        logger.error(f"Similarity search error: {e}")
+        logger.error(f"❌ Similarity search error: {e}")
         return []
 
-# Load dataset on startup
+# Load dataset on startup (but not model - load on demand)
 load_dataset()
 
 @app.route('/health', methods=['GET'])
@@ -265,6 +291,15 @@ def health_check():
                 if os.path.isfile(file):
                     size = os.path.getsize(file)
                     files_info.append(f"{file} ({size} bytes)")
+                elif os.path.isdir(file):
+                    # Check if it's a model directory
+                    try:
+                        dir_size = sum(os.path.getsize(os.path.join(file, f)) 
+                                     for f in os.listdir(file) 
+                                     if os.path.isfile(os.path.join(file, f)))
+                        files_info.append(f"{file}/ (directory, {dir_size} bytes)")
+                    except:
+                        files_info.append(f"{file}/ (directory)")
         except:
             files_info = ["Could not list files"]
         
@@ -275,18 +310,47 @@ def health_check():
             'model_loaded': app_state['model_loaded'],
             'tf_available': app_state['tf_available'],
             'error': app_state['error'],
-            'files': files_info[:5],
+            'files': files_info[:10],
             'server_working': True
         }
         
         return safe_json_response(health_data)
         
     except Exception as e:
-        logger.error(f"Health check error: {e}")
+        logger.error(f"❌ Health check error: {e}")
         return safe_json_response({
             'status': 'error',
             'error': str(e),
             'server_working': True
+        }, 500)
+
+@app.route('/load-model', methods=['POST'])
+def load_model_endpoint():
+    """Manually trigger model loading"""
+    try:
+        if app_state['model_loaded']:
+            return safe_json_response({
+                'message': 'Model already loaded',
+                'model_loaded': True
+            })
+        
+        success = load_saved_model()
+        
+        if success:
+            return safe_json_response({
+                'message': 'Model loaded successfully',
+                'model_loaded': True,
+                'tf_available': app_state['tf_available']
+            })
+        else:
+            return safe_json_response({
+                'error': 'Failed to load model',
+                'details': app_state['error']
+            }, 500)
+            
+    except Exception as e:
+        return safe_json_response({
+            'error': f'Model loading failed: {str(e)}'
         }, 500)
 
 @app.route('/classify', methods=['POST', 'OPTIONS'])
@@ -297,7 +361,7 @@ def classify_image():
         return safe_json_response({'message': 'CORS preflight OK'})
     
     try:
-        logger.info("Classification request received")
+        logger.info("🔄 Classification request received")
         
         # Check dataset
         if not app_state['dataset_loaded']:
@@ -306,7 +370,7 @@ def classify_image():
                 'details': app_state.get('error', 'Unknown error')
             }, 500)
         
-        # Check request
+        # Validate request
         if 'image' not in request.files and 'image' not in request.json:
             return safe_json_response({
                 'error': 'No image provided'
@@ -326,21 +390,25 @@ def classify_image():
             return safe_json_response({'error': 'Invalid image data'}, 400)
         
         # Process image
+        logger.info("🔄 Preprocessing image...")
         img_array = preprocess_image_safe(image_data)
         if img_array is None:
             return safe_json_response({'error': 'Failed to preprocess image'}, 500)
         
         # Extract features
+        logger.info("🔄 Extracting features...")
         features = extract_features_safe(img_array)
         if features is None:
             return safe_json_response({'error': 'Failed to extract features'}, 500)
         
         # Find similar images
+        logger.info("🔄 Finding similar images...")
         similar_images = find_similar_images_safe(features, top_k=5)
         if not similar_images:
             return safe_json_response({'error': 'No similar images found'}, 500)
         
         # Classification by voting
+        logger.info("🔄 Performing classification...")
         class_votes = {}
         for item in similar_images[:3]:
             if item['class']:
@@ -360,10 +428,11 @@ def classify_image():
             }
         }
         
+        logger.info(f"✅ Classification complete: {best_class}")
         return safe_json_response(result)
         
     except Exception as e:
-        logger.error(f"Classification error: {e}")
+        logger.error(f"❌ Classification error: {e}")
         logger.error(f"Traceback: {traceback.format_exc()}")
         
         return safe_json_response({
@@ -409,5 +478,5 @@ def after_request(response):
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
-    logger.info(f"Starting server on port {port}")
+    logger.info(f"🚀 Starting server on port {port}")
     app.run(host='0.0.0.0', port=port, debug=False, threaded=True)
